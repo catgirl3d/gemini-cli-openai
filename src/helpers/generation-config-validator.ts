@@ -47,6 +47,46 @@ export class GenerationConfigValidator {
 		return typeof value === "string" && ["none", "low", "medium", "high"].includes(value);
 	}
 
+	private static extractUnionSchema(schema: Record<string, JsonValue>): JsonValue | undefined {
+		const unionKeys = ["anyOf", "oneOf", "allOf"];
+		for (const key of unionKeys) {
+			const value = schema[key];
+			if (Array.isArray(value) && value.length > 0) {
+				return value[0];
+			}
+		}
+		return undefined;
+	}
+
+	private static inferSchemaType(schema: Record<string, JsonValue>): string | undefined {
+		if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+			return "object";
+		}
+		if (schema.items) {
+			return "array";
+		}
+		return undefined;
+	}
+
+	private static normalizeTypeValue(
+		value: JsonValue,
+		schema: Record<string, JsonValue>
+	): { type?: string; nullable: boolean } {
+		if (Array.isArray(value)) {
+			const stringTypes = value.filter((item): item is string => typeof item === "string");
+			const nullable = stringTypes.includes("null");
+			const nonNullTypes = stringTypes.filter((item) => item !== "null");
+			const resolvedType = nonNullTypes[0] ?? this.inferSchemaType(schema) ?? "string";
+			return { type: resolvedType, nullable };
+		}
+
+		if (typeof value === "string") {
+			return { type: value, nullable: false };
+		}
+
+		return { type: this.inferSchemaType(schema), nullable: false };
+	}
+
 	/**
 	 * Recursively cleans a schema object to remove fields not supported by Gemini
 	 * (like keys starting with $, strict, const, etc.)
@@ -60,12 +100,53 @@ export class GenerationConfigValidator {
 			return schema.map((item) => this.cleanSchema(item));
 		}
 
-		const cleaned: { [key: string]: JsonValue } = {};
-		const unsupportedKeys = ["strict", "const", "additionalProperties", "exclusiveMaximum", "exclusiveMinimum"];
+		const schemaObject = schema as Record<string, JsonValue>;
+		const baseUnionSchema = this.extractUnionSchema(schemaObject);
+		const cleaned: { [key: string]: JsonValue } =
+			baseUnionSchema && typeof baseUnionSchema === "object" && !Array.isArray(baseUnionSchema)
+				? (this.cleanSchema(baseUnionSchema) as { [key: string]: JsonValue })
+				: {};
+		const unsupportedKeys = [
+			"strict",
+			"const",
+			"additionalProperties",
+			"exclusiveMaximum",
+			"exclusiveMinimum",
+			"default",
+			"format",
+			"anyOf",
+			"oneOf",
+			"allOf"
+		];
 
-		for (const [key, value] of Object.entries(schema)) {
+		for (const [key, value] of Object.entries(schemaObject)) {
 			// Remove OpenAI/JSON Schema specific fields not supported by Gemini
 			if (key.startsWith("$") || unsupportedKeys.includes(key)) {
+				continue;
+			}
+
+			if (key === "type") {
+				const { type, nullable } = this.normalizeTypeValue(value, schemaObject);
+				if (type) {
+					cleaned.type = type;
+				}
+				if (nullable) {
+					cleaned.nullable = true;
+				}
+				continue;
+			}
+
+			if (key === "nullable") {
+				const normalizedNullable = typeof value === "boolean" ? value : Boolean(value);
+				cleaned.nullable = cleaned.nullable === true || normalizedNullable;
+				continue;
+			}
+
+			if (key === "items") {
+				const itemsSchema = Array.isArray(value) ? value[0] : value;
+				if (itemsSchema !== undefined) {
+					cleaned.items = this.cleanSchema(itemsSchema);
+				}
 				continue;
 			}
 
